@@ -1,5 +1,10 @@
 # Copy to terraform.tfvars and fill in your own values.
 region       = "ap-southeast-1"
 project      = "devops-lab"
-github_owner = "your-github-username"
+github_owner = "farro97"
 github_repo  = "devops-lab"
+
+# Optional: numeric IDs, needed if GitHub puts IDs in the OIDC subject
+# (repo:owner@123/repo@456:...). See variables.tf for where to find them.
+github_owner_id = ""
+github_repo_id  = ""

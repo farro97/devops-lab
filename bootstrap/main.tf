@@ -40,6 +40,17 @@ locals {
   # Bucket names are global across ALL AWS accounts, so we add the account ID.
   state_bucket = "${var.project}-tfstate-${local.account_id}"
   repo         = "${var.github_owner}/${var.github_repo}"
+
+  # GitHub can put the token subject in one of two forms:
+  #   classic:  repo:OWNER/REPO:...
+  #   with IDs: repo:OWNER@OWNER_ID/REPO@REPO_ID:...
+  # The ID form can't be reused if someone later takes over the same
+  # username or repo name. We accept both so the roles keep working
+  # whichever one GitHub sends.
+  repo_subjects = compact([
+    local.repo,
+    var.github_owner_id != "" && var.github_repo_id != "" ? "${var.github_owner}@${var.github_owner_id}/${var.github_repo}@${var.github_repo_id}" : "",
+  ])
 }
 
 # -----------------------------------------------------------------------------
@@ -168,7 +179,7 @@ data "aws_iam_policy_document" "plan_trust" {
     condition {
       test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${local.repo}:pull_request"]
+      values   = [for r in local.repo_subjects : "repo:${r}:pull_request"]
     }
   }
 }
@@ -224,7 +235,7 @@ data "aws_iam_policy_document" "apply_trust" {
     condition {
       test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${local.repo}:environment:dev"]
+      values   = [for r in local.repo_subjects : "repo:${r}:environment:dev"]
     }
   }
 }
