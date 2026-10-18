@@ -27,5 +27,5 @@ variable "enable_nat_gateway" {
 variable "app_port" {
   description = "Port your container listens on."
   type        = number
-  default     = 8000
+  default     = 8001
 }
