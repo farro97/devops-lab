@@ -1,0 +1,5 @@
+# Copy to terraform.tfvars and fill in your own values.
+region       = "ap-southeast-1"
+project      = "devops-lab"
+github_owner = "your-github-username"
+github_repo  = "devops-lab"

@@ -1,0 +1,181 @@
+# -----------------------------------------------------------------------------
+# Terraform CI/CD
+#   Pull request -> fmt, validate, security scan, plan (posted as a PR comment)
+#   Merge to main -> apply to dev (gated by the `dev` GitHub environment)
+#
+# Authentication uses OIDC: GitHub hands AWS a short-lived token, AWS returns
+# temporary credentials for a role. No AWS keys are stored in GitHub.
+#
+# Repo settings needed (Settings -> Secrets and variables -> Actions -> Variables):
+#   AWS_REGION          e.g. ap-southeast-1
+#   TF_STATE_BUCKET     bootstrap output: state_bucket
+#   AWS_PLAN_ROLE_ARN   bootstrap output: github_plan_role_arn
+#   AWS_APPLY_ROLE_ARN  bootstrap output: github_apply_role_arn
+# And an environment called `dev` (Settings -> Environments).
+# -----------------------------------------------------------------------------
+
+name: terraform
+
+on:
+  pull_request:
+    paths:
+      - "infra/**"
+      - ".github/workflows/terraform.yml"
+  push:
+    branches: [main]
+    paths:
+      - "infra/**"
+      - ".github/workflows/terraform.yml"
+  workflow_dispatch:
+
+# Never run two applies against the same state at once.
+concurrency:
+  group: terraform-dev
+  cancel-in-progress: false
+
+env:
+  TF_VERSION: "1.13.4"
+  TF_IN_AUTOMATION: "true"
+  WORKDIR: infra/envs/dev
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Static checks: no AWS access needed
+  # ---------------------------------------------------------------------------
+  checks:
+    name: fmt / validate / scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive infra
+
+      - name: terraform validate
+        working-directory: ${{ env.WORKDIR }}
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+
+      - name: Checkov security scan
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: infra
+          framework: terraform
+          quiet: true
+          # Start in report-only mode while learning. Change to false to make
+          # findings fail the build once you understand them.
+          soft_fail: true
+
+  # ---------------------------------------------------------------------------
+  # Plan on pull requests (read-only role)
+  # ---------------------------------------------------------------------------
+  plan:
+    name: plan (dev)
+    if: github.event_name == 'pull_request'
+    needs: checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write       # required for OIDC
+      pull-requests: write  # to post the plan as a comment
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials (plan role)
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: terraform init
+        working-directory: ${{ env.WORKDIR }}
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ vars.AWS_REGION }}"
+
+      - name: terraform plan
+        id: plan
+        working-directory: ${{ env.WORKDIR }}
+        run: |
+          set +e
+          terraform plan -input=false -no-color -lock-timeout=5m -out=tfplan > plan.txt 2>&1
+          code=$?
+          cat plan.txt
+          exit $code
+
+      - name: Post plan to PR
+        if: always() && steps.plan.outcome != 'skipped'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require('fs');
+            let plan = fs.readFileSync('${{ env.WORKDIR }}/plan.txt', 'utf8');
+            const max = 60000;
+            if (plan.length > max) plan = plan.slice(-max) + '\n... (truncated, see job log)';
+            const body = [
+              `### Terraform plan: \`dev\` (${{ steps.plan.outcome }})`,
+              '<details><summary>Show plan</summary>',
+              '',
+              '```hcl',
+              plan,
+              '```',
+              '</details>',
+            ].join('\n');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+
+  # ---------------------------------------------------------------------------
+  # Apply on main (apply role, protected `dev` environment)
+  # ---------------------------------------------------------------------------
+  apply:
+    name: apply (dev)
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    needs: checks
+    runs-on: ubuntu-latest
+    environment: dev        # this is what the apply role's trust policy checks
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials (apply role)
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.AWS_APPLY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: terraform init
+        working-directory: ${{ env.WORKDIR }}
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ vars.AWS_REGION }}"
+
+      - name: terraform apply
+        working-directory: ${{ env.WORKDIR }}
+        run: terraform apply -input=false -auto-approve -lock-timeout=5m
