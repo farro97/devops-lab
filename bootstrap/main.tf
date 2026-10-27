@@ -253,3 +253,87 @@ resource "aws_iam_role_policy_attachment" "github_apply_admin" {
   role       = aws_iam_role.github_apply.name
   policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/AdministratorAccess"
 }
+
+# -----------------------------------------------------------------------------
+# 3c. DEPLOY role (app pipeline: push image to ECR, roll out on ECS)
+# Least privilege: unlike the apply role, this one cannot create or delete
+# infrastructure. It can only do the handful of things a release needs.
+# Uses the same trust as the apply role (main branch via the `dev` environment).
+# -----------------------------------------------------------------------------
+
+resource "aws_iam_role" "github_deploy" {
+  name                 = "${var.project}-github-deploy"
+  assume_role_policy   = data.aws_iam_policy_document.apply_trust.json
+  max_session_duration = 3600
+}
+
+data "aws_iam_policy_document" "deploy" {
+  # Logging in to ECR is account-wide; it can't be scoped to one repo.
+  statement {
+    sid       = "EcrLogin"
+    actions   = ["ecr:GetAuthorizationToken"]
+    resources = ["*"]
+  }
+
+  statement {
+    sid = "EcrPushPull"
+    actions = [
+      "ecr:BatchCheckLayerAvailability",
+      "ecr:BatchGetImage",
+      "ecr:CompleteLayerUpload",
+      "ecr:DescribeImages",
+      "ecr:DescribeImageScanFindings",
+      "ecr:GetDownloadUrlForLayer",
+      "ecr:InitiateLayerUpload",
+      "ecr:PutImage",
+      "ecr:UploadLayerPart",
+    ]
+    resources = ["arn:${data.aws_partition.current.partition}:ecr:${var.region}:${local.account_id}:repository/${var.project}-*"]
+  }
+
+  # Task definitions can't be scoped by name for Describe/Register.
+  statement {
+    sid = "EcsTaskDefinitions"
+    actions = [
+      "ecs:DescribeTaskDefinition",
+      "ecs:RegisterTaskDefinition",
+    ]
+    resources = ["*"]
+  }
+
+  statement {
+    sid = "EcsServices"
+    actions = [
+      "ecs:DescribeServices",
+      "ecs:UpdateService",
+    ]
+    resources = ["arn:${data.aws_partition.current.partition}:ecs:${var.region}:${local.account_id}:service/${var.project}-*/*"]
+  }
+
+  statement {
+    sid       = "EcsTagging"
+    actions   = ["ecs:TagResource"]
+    resources = ["arn:${data.aws_partition.current.partition}:ecs:${var.region}:${local.account_id}:task-definition/${var.project}-*:*"]
+  }
+
+  # A new task definition revision references the task + execution roles,
+  # so the pipeline must be allowed to "pass" them to ECS. Only roles that
+  # follow the "<project>-*-ecs-*" naming convention, and only to ECS tasks.
+  statement {
+    sid       = "PassTaskRoles"
+    actions   = ["iam:PassRole"]
+    resources = ["arn:${data.aws_partition.current.partition}:iam::${local.account_id}:role/${var.project}-*-ecs-*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "iam:PassedToService"
+      values   = ["ecs-tasks.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role_policy" "github_deploy" {
+  name   = "deploy-app"
+  role   = aws_iam_role.github_deploy.id
+  policy = data.aws_iam_policy_document.deploy.json
+}

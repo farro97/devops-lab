@@ -1,0 +1,227 @@
+# -----------------------------------------------------------------------------
+# App CI/CD
+#   Pull request  -> lint, test, build image, Trivy scan, smoke test
+#   Merge to main -> all of the above, then push the SAME image to ECR and
+#                    roll it out to ECS (gated by the `dev` GitHub environment)
+#
+# "Build once, deploy the same artifact": the image is built and scanned in
+# the build job, saved as a workflow artifact, and the deploy job pushes that
+# exact image. Nothing is rebuilt between testing and production.
+#
+# Repo settings needed (Settings -> Secrets and variables -> Actions -> Variables):
+#   AWS_REGION           e.g. ap-southeast-1
+#   AWS_DEPLOY_ROLE_ARN  bootstrap output: github_deploy_role_arn
+# -----------------------------------------------------------------------------
+
+name: app
+
+on:
+  pull_request:
+    paths:
+      - "app/**"
+      - ".github/workflows/app.yml"
+  push:
+    branches: [main]
+    paths:
+      - "app/**"
+      - ".github/workflows/app.yml"
+  workflow_dispatch:
+
+# Default for every job: read-only. Jobs that need more ask for it explicitly.
+permissions:
+  contents: read
+
+# Names follow the Terraform naming convention: <project>-<environment>-...
+env:
+  ECR_REPOSITORY: devops-lab-dev-app
+  ECS_CLUSTER: devops-lab-dev
+  ECS_SERVICE: devops-lab-dev-app
+  TASK_FAMILY: devops-lab-dev-app
+  CONTAINER_NAME: app
+  LOCAL_IMAGE: devops-lab-app:${{ github.sha }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  test:
+    name: lint + unit tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: app
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: app/requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Lint (ruff)
+        run: |
+          ruff check .
+          ruff format --check .
+
+      - name: Unit tests (pytest)
+        run: pytest -q
+
+  # ---------------------------------------------------------------------------
+  build:
+    name: build + scan image
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build image
+        run: docker build --pull -t "$LOCAL_IMAGE" app
+
+      # Full report of CRITICAL + HIGH findings, for humans. Doesn't fail.
+      - name: Trivy scan (report)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.LOCAL_IMAGE }}
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "0"
+
+      # The gate: block the release if there's a CRITICAL issue with a fix
+      # available. Tighten to CRITICAL,HIGH once you're comfortable.
+      - name: Trivy scan (gate on CRITICAL)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.LOCAL_IMAGE }}
+          format: table
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          skip-setup-trivy: true
+
+      # Does the container actually start and answer /health?
+      - name: Smoke test container
+        run: |
+          docker run -d --name smoke -p 8000:8000 "$LOCAL_IMAGE"
+          for i in $(seq 1 20); do
+            if curl -fsS http://localhost:8000/health; then echo; echo "healthy"; exit 0; fi
+            sleep 1
+          done
+          echo "container did not become healthy"; docker logs smoke; exit 1
+
+      - name: Save image
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        run: docker save "$LOCAL_IMAGE" | gzip > image.tar.gz
+
+      - name: Upload image artifact
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v7
+        with:
+          name: image
+          path: image.tar.gz
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: deploy (dev)
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    environment: dev          # the deploy role's trust policy requires this
+    concurrency:
+      group: deploy-dev
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write         # required for OIDC
+
+    steps:
+      - name: Download image artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: image
+
+      - name: Configure AWS credentials (deploy role)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Push image to ECR
+        id: push
+        env:
+          IMAGE_URI: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+        run: |
+          echo "image=$IMAGE_URI" >> "$GITHUB_OUTPUT"
+          # Tags are immutable, so on a re-run the image may already be there.
+          if aws ecr describe-images --repository-name "$ECR_REPOSITORY" \
+               --image-ids imageTag="${{ github.sha }}" >/dev/null 2>&1; then
+            echo "Image already in ECR, skipping push"
+            exit 0
+          fi
+          gunzip -c image.tar.gz | docker load
+          docker tag "$LOCAL_IMAGE" "$IMAGE_URI"
+          docker push "$IMAGE_URI"
+
+      # On the very first merge, the terraform workflow runs at the same time
+      # and the database takes several minutes to create. Wait for the ECS
+      # service to exist instead of failing.
+      - name: Wait for ECS service to exist
+        run: |
+          for i in $(seq 1 40); do
+            count=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+              --query "length(services[?status=='ACTIVE'])" --output text 2>/dev/null || echo 0)
+            if [ "$count" = "1" ]; then echo "service found"; exit 0; fi
+            echo "waiting for $ECS_CLUSTER/$ECS_SERVICE (attempt $i/40)..."
+            sleep 30
+          done
+          echo "ECS service not found after 20 minutes. Has the terraform workflow applied?"; exit 1
+
+      # Start from the latest task definition revision (which carries any
+      # settings Terraform changed) and swap in the new image.
+      - name: Get current task definition
+        run: |
+          aws ecs describe-task-definition --task-definition "$TASK_FAMILY" \
+            --query taskDefinition > task-definition.json
+
+      - name: Render new task definition
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.push.outputs.image }}
+          environment-variables: |
+            APP_VERSION=${{ github.sha }}
+
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          service: ${{ env.ECS_SERVICE }}
+          # Wait until new tasks pass ALB health checks. If they don't, the
+          # ECS circuit breaker rolls back and this step fails.
+          wait-for-service-stability: true
+          wait-for-minutes: 10
+
+      - name: Summary
+        run: |
+          {
+            echo "### Deployed to dev"
+            echo ""
+            echo "- Image: \`${{ steps.push.outputs.image }}\`"
+            echo "- Cluster / service: \`$ECS_CLUSTER\` / \`$ECS_SERVICE\`"
+          } >> "$GITHUB_STEP_SUMMARY"

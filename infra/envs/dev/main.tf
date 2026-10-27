@@ -1,3 +1,10 @@
+# -----------------------------------------------------------------------------
+# dev environment
+#   main.tf      network + container registry (Phase 1)
+#   security.tf  security groups that connect the pieces
+#   app.tf       ECS cluster, load balancer, database, app service (Phase 1b)
+# -----------------------------------------------------------------------------
+
 locals {
   name = "${var.project}-${var.environment}"
 }
@@ -13,8 +20,8 @@ module "vpc" {
   cidr_block = var.vpc_cidr
   az_count   = 2
 
-  # Off by default to keep costs near zero while you learn.
-  # Turn on when you add ECS/RDS in private subnets and they need internet.
+  # See var.enable_nat_gateway: decides whether app tasks run in private
+  # subnets (behind NAT) or in public subnets (no NAT, cheaper).
   enable_nat_gateway = var.enable_nat_gateway
   single_nat_gateway = true
 }
@@ -72,32 +79,4 @@ resource "aws_ecr_lifecycle_policy" "app" {
       }
     ]
   })
-}
-
-# -----------------------------------------------------------------------------
-# Security group for the app (used in the next step, ECS Fargate)
-# -----------------------------------------------------------------------------
-
-resource "aws_security_group" "app" {
-  name        = "${local.name}-app"
-  description = "App containers. Allows inbound on the app port from inside the VPC only."
-  vpc_id      = module.vpc.vpc_id
-
-  tags = { Name = "${local.name}-app" }
-}
-
-resource "aws_vpc_security_group_ingress_rule" "app_from_vpc" {
-  security_group_id = aws_security_group.app.id
-  description       = "App port from within the VPC (e.g. a load balancer)"
-  cidr_ipv4         = module.vpc.vpc_cidr_block
-  from_port         = var.app_port
-  to_port           = var.app_port
-  ip_protocol       = "tcp"
-}
-
-resource "aws_vpc_security_group_egress_rule" "app_all_out" {
-  security_group_id = aws_security_group.app.id
-  description       = "Outbound to anywhere (pull images, call APIs)"
-  cidr_ipv4         = "0.0.0.0/0"
-  ip_protocol       = "-1"
 }

@@ -1,4 +1,4 @@
-# devops-lab: Phase 1 (Terraform on AWS)
+# devops-lab: Terraform + CI/CD on AWS
 
 A learning project that builds real-world AWS infrastructure with Terraform and
 deploys it through a GitHub Actions pipeline, the way a DevOps team would.
@@ -163,13 +163,7 @@ ticket you might get at work:
    a separate `prod` GitHub environment with required reviewers.
 6. **Add a `tflint` step** to the `checks` job.
 
-## Next step: Phase 1b
+## Phase 1b: run the app
 
-Add to `envs/dev`:
-- An **Application Load Balancer** in the public subnets
-- An **ECS Fargate** cluster, task definition and service in the private subnets,
-  using the image from ECR (this is when you turn on the NAT Gateway, or add VPC
-  endpoints for ECR and CloudWatch Logs instead)
-- An **RDS Postgres** database with its password in **Secrets Manager**
-- A second workflow that builds your Docker image, scans it with Trivy, and
-  pushes it to ECR
+The app (FastAPI + Postgres), load balancer, ECS Fargate service, RDS database
+and the app CI/CD pipeline are covered in **[docs/phase-1b.md](docs/phase-1b.md)**.

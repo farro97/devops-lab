@@ -12,3 +12,8 @@ output "github_apply_role_arn" {
   description = "Add as GitHub repo variable AWS_APPLY_ROLE_ARN."
   value       = aws_iam_role.github_apply.arn
 }
+
+output "github_deploy_role_arn" {
+  description = "Add as GitHub variable AWS_DEPLOY_ROLE_ARN (used by the app pipeline)."
+  value       = aws_iam_role.github_deploy.arn
+}
