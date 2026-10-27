@@ -1,0 +1,30 @@
+# Run the app + a Postgres database on your laptop, no AWS needed:
+#   cd app
+#   docker compose up --build
+#   then open http://localhost:8000/db
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      ENVIRONMENT: local
+      DB_HOST: db
+      DB_NAME: app
+      DB_USER: app
+      DB_PASSWORD: localdev-only
+      DB_SSLMODE: disable   # local Postgres has no TLS; RDS requires it
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: app
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: localdev-only
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d app"]
+      interval: 5s
+      retries: 10
